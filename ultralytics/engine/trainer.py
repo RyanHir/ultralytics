@@ -23,7 +23,7 @@ from torch import nn, optim
 
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
-from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
+from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights, torch_safe_load
 from ultralytics.utils import (
     DEFAULT_CFG,
     LOCAL_RANK,
@@ -232,8 +232,12 @@ class BaseTrainer:
         # Model
         self.run_callbacks("on_pretrain_routine_start")
         ckpt = self.setup_model()
-        self.model = self.model.to(self.device)
         self.set_model_attributes()
+        with torch.no_grad():
+            teacher, _ = torch_safe_load("yolov8s.pt") # calls Model(cfg, weights)
+            teacher = teacher["model"].to(self.device).float().eval()
+            self.model.teacher = teacher.to(self.device)
+        self.model = self.model.to(self.device)
 
         # Freeze layers
         freeze_list = (

@@ -280,7 +280,11 @@ class BaseModel(nn.Module):
             self.criterion = self.init_criterion()
 
         preds = self.forward(batch["img"]) if preds is None else preds
-        return self.criterion(preds, batch)
+        if hasattr(self, "teacher"):
+            teach = self.teacher.forward(batch["img"])
+        else:
+            teach = None
+        return self.criterion(preds, teach, batch)
 
     def init_criterion(self):
         """Initialize the loss criterion for the BaseModel."""
@@ -379,7 +383,7 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self, teacher=getattr(self, "teacher", None))
 
 
 class OBBModel(DetectionModel):
