@@ -234,7 +234,7 @@ class BaseTrainer:
         ckpt = self.setup_model()
         self.set_model_attributes()
         with torch.no_grad():
-            teacher, _ = torch_safe_load("yolov8s.pt") # calls Model(cfg, weights)
+            teacher, _ = torch_safe_load("yolov8x.pt") # calls Model(cfg, weights)
             teacher = teacher["model"].to(self.device).float().eval()
             self.model.teacher = teacher.to(self.device)
         self.model = self.model.to(self.device)
@@ -251,7 +251,7 @@ class BaseTrainer:
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-            if any(x in k for x in freeze_layer_names):
+            if any(x in k for x in freeze_layer_names) or k.startswith("teacher."):
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
