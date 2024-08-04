@@ -281,7 +281,8 @@ class BaseModel(nn.Module):
 
         preds = self.forward(batch["img"]) if preds is None else preds
         if hasattr(self, "teacher"):
-            teach = self.teacher.forward(batch["img"])
+            with torch.no_grad():
+                teach = self.teacher.forward(batch["img"])
         else:
             teach = None
         return self.criterion(preds, teach, batch)

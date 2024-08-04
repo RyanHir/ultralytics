@@ -234,7 +234,7 @@ class BaseTrainer:
         ckpt = self.setup_model()
         self.set_model_attributes()
         with torch.no_grad():
-            teacher, _ = torch_safe_load("yolov8x.pt") # calls Model(cfg, weights)
+            teacher, _ = torch_safe_load("yolov8m.pt") # calls Model(cfg, weights)
             teacher = teacher["model"].to(self.device).float().eval()
             self.model.teacher = teacher.to(self.device)
         self.model = self.model.to(self.device)

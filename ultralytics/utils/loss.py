@@ -217,7 +217,7 @@ class v8DetectionLoss:
 
     def __call__(self, preds, teach, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -230,14 +230,6 @@ class v8DetectionLoss:
         batch_size = pred_scores.shape[0]
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
-
-        if teach is not None:
-            feats = teach[1] if isinstance(teach, tuple) else teach
-            teach_distri, teach_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-                (self.reg_max * 4, self.nc), 1
-            )
-            teach_scores = teach_scores.permute(0, 2, 1).contiguous()
-            teach_distri = teach_distri.permute(0, 2, 1).contiguous()
 
         # Targets
         targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
@@ -256,16 +248,6 @@ class v8DetectionLoss:
             gt_bboxes,
             mask_gt,
         )
-        if teach is not None:
-            teach_bboxes = self.bbox_decode(anchor_points, teach_distri)  # xyxy, (b, h*w, 4)
-            _, teach_bboxes, teach_scores, _, _ = self.assigner(
-                teach_scores.detach().sigmoid(),
-                (teach_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-                anchor_points * stride_tensor,
-                gt_labels,
-                gt_bboxes,
-                mask_gt,
-            )
 
         target_scores_sum = max(target_scores.sum(), 1)
 
@@ -279,15 +261,22 @@ class v8DetectionLoss:
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
+        loss[0] *= self.hyp.box # box gain
+        loss[1] *= self.hyp.cls # cls gain
+        loss[2] *= self.hyp.dfl # dfl gain
 
         if hasattr(self, "distill_loss"):
-            # soft_target_loss = self.distill_loss(teach_bboxes, pred_bboxes, 4)
-            # loss[0] += soft_target_loss * 0.00001
-            soft_target_loss = self.distill_loss(teach_scores, pred_scores, 64)
-            loss[1] += soft_target_loss * 0.0001
+            def imitation_loss(teacher, student):
+                teacher = nn.functional.softmax(teacher, dim=-1)
+                student = nn.functional.softmax(student, dim=-1)
+                diff = torch.pow(teacher - student, 2)
+                diff = diff.sum() / 2
+                return diff
+            for i in range(len(preds)):
+                teach_ = teach[1][i] if isinstance(teach, tuple) else teach[i]
+                preds_ = preds[1][i] if isinstance(teach, tuple) else preds[i]
+                loss[3] += imitation_loss(teach_.detach(), preds_.detach())
+            loss[3] *= 0.0002
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 
