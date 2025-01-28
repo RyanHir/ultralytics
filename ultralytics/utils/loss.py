@@ -153,18 +153,10 @@ class KeypointLoss(nn.Module):
         e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)  # from cocoeval
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
-class DistillLoss(nn.Module):
-    def forward(self, teacher, student, T):
-        soft_targets = nn.functional.softmax(teacher / T, dim=-1)
-        soft_prob = nn.functional.log_softmax(student / T, dim=-1)
-        soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (T**2)
-        
-        return soft_targets_loss
-
 class v8DetectionLoss:
     """Criterion class for computing training losses."""
 
-    def __init__(self, model, tal_topk=10, teacher=None):  # model must be de-paralleled
+    def __init__(self, model, tal_topk=10):  # model must be de-paralleled
         """Initializes v8DetectionLoss with the model, defining model-related properties and BCE loss function."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -183,9 +175,6 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
-        
-        if teacher is not None:
-            self.distill_loss = DistillLoss().to(device)
 
 
     def preprocess(self, targets, batch_size, scale_tensor):
@@ -214,9 +203,9 @@ class v8DetectionLoss:
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
-    def __call__(self, preds, teach, batch):
+    def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(4, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -267,19 +256,6 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls # cls gain
         loss[2] *= self.hyp.dfl # dfl gain
 
-        if hasattr(self, "distill_loss"):
-            def imitation_loss(teacher, student):
-                teacher = nn.functional.softmax(teacher, dim=-1)
-                student = nn.functional.softmax(student, dim=-1)
-                diff = torch.pow(teacher - student, 2)
-                diff = diff.sum() / 2
-                return diff
-            for i in range(len(preds)):
-                teach_ = teach[1][i] if isinstance(teach, tuple) else teach[i]
-                preds_ = preds[1][i] if isinstance(teach, tuple) else preds[i]
-                loss[3] += imitation_loss(teach_.detach(), preds_.detach())
-            loss[3] *= 0.0002
-
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 
 
@@ -291,7 +267,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         super().__init__(model)
         self.overlap = model.args.overlap_mask
 
-    def __call__(self, preds, teach, batch):
+    def __call__(self, preds, batch):
         """Calculate and return the loss for the YOLO model."""
         loss = torch.zeros(4, device=self.device)  # box, cls, dfl
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
@@ -479,7 +455,7 @@ class v8PoseLoss(v8DetectionLoss):
         sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
 
-    def __call__(self, preds, teach, batch):
+    def __call__(self, preds, batch):
         """Calculate the total loss and detach it."""
         loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
@@ -658,7 +634,7 @@ class v8OBBLoss(v8DetectionLoss):
                     out[j, :n] = torch.cat([targets[matches, 1:2], bboxes], dim=-1)
         return out
 
-    def __call__(self, preds, teach, batch):
+    def __call__(self, preds, batch):
         """Calculate and return the loss for the YOLO model."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
@@ -764,3 +740,279 @@ class E2EDetectLoss:
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, teach["one2one"], batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
+class CWDLoss(nn.Module):
+    """PyTorch version of `Channel-wise Distillation for Semantic Segmentation.
+    <https://arxiv.org/abs/2011.13256>`_.
+    """
+
+    def __init__(self, channels_s, channels_t, tau=1.0):
+        super().__init__()
+        self.tau = tau
+
+    def forward(self, y_s, y_t):
+        """Forward computation.
+        Args:
+            y_s (list): The student model prediction with
+                shape (N, C, H, W) in list.
+            y_t (list): The teacher model prediction with
+                shape (N, C, H, W) in list.
+        Return:
+            torch.Tensor: The calculated loss value of all stages.
+        """
+        assert len(y_s) == len(y_t)
+        losses = []
+
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            assert s.shape == t.shape
+            N, C, H, W = s.shape
+
+            # normalize in channel dimension
+            softmax_pred_T = F.softmax(t.view(-1, W * H) / self.tau, dim=1)
+
+            logsoftmax = torch.nn.LogSoftmax(dim=1)
+            cost = torch.sum(
+                softmax_pred_T * logsoftmax(t.view(-1, W * H) / self.tau) -
+                softmax_pred_T * logsoftmax(s.view(-1, W * H) / self.tau)) * (self.tau ** 2)
+
+            losses.append(cost / (C * N))
+        loss = sum(losses)
+        return loss
+
+class MGDLoss(nn.Module):
+    def __init__(self,
+                 student_channels,
+                 teacher_channels,
+                 alpha_mgd=0.00002,
+                 lambda_mgd=0.65,
+                 ):
+        super(MGDLoss, self).__init__()
+        self.alpha_mgd = alpha_mgd
+        self.lambda_mgd = lambda_mgd
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        self.generation = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(channel, channel, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channel, channel, kernel_size=3, padding=1)
+            ).to(device) for channel in teacher_channels
+        ])
+
+    def forward(self, y_s, y_t, layer=None):
+        """Forward computation.
+        Args:
+            y_s (list): The student model prediction with
+                shape (N, C, H, W) in list.
+            y_t (list): The teacher model prediction with
+                shape (N, C, H, W) in list.
+        Return:
+            torch.Tensor: The calculated loss value of all stages.
+        """
+        losses = []
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            # print(s.shape)
+            # print(t.shape)
+            # assert s.shape == t.shape
+            if layer == "outlayer":
+                idx = -1
+            losses.append(self.get_dis_loss(s, t, idx) * self.alpha_mgd)
+        loss = sum(losses)
+        return loss
+
+    def get_dis_loss(self, preds_S, preds_T, idx):
+        loss_mse = nn.MSELoss(reduction='sum')
+        N, C, H, W = preds_T.shape
+
+        device = preds_S.device
+        mat = torch.rand((N, 1, H, W)).to(device)
+        mat = torch.where(mat > 1 - self.lambda_mgd, 0, 1).to(device)
+
+        masked_fea = torch.mul(preds_S, mat)
+        new_fea = self.generation[idx](masked_fea)
+
+        dis_loss = loss_mse(new_fea, preds_T) / N
+        return dis_loss
+
+
+class FeatureLoss(nn.Module):
+    def __init__(self, channels_s, channels_t, distiller='mgd', loss_weight=1.0):
+        super(FeatureLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.distiller = distiller
+        
+        # Move all modules to same precision
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Convert to ModuleList and ensure consistent dtype
+        self.align_module = nn.ModuleList()
+        self.norm = nn.ModuleList()
+        self.norm1 = nn.ModuleList()
+        
+        # Create alignment modules
+        for s_chan, t_chan in zip(channels_s, channels_t):
+            align = nn.Sequential(
+                nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
+                nn.BatchNorm2d(t_chan, affine=False)
+            ).to(device)
+            self.align_module.append(align)
+            
+        # Create normalization layers
+        for t_chan in channels_t:
+            self.norm.append(nn.BatchNorm2d(t_chan, affine=False).to(device))
+            
+        for s_chan in channels_s:
+            self.norm1.append(nn.BatchNorm2d(s_chan, affine=False).to(device))
+
+        if distiller == 'mgd':
+            self.feature_loss = MGDLoss(channels_s, channels_t)
+        elif distiller == 'cwd':
+            self.feature_loss = CWDLoss(channels_s, channels_t)
+        else:
+            raise NotImplementedError
+
+    def forward(self, y_s, y_t):
+        if len(y_s) != len(y_t):
+            y_t = y_t[len(y_t) // 2:]
+
+        tea_feats = []
+        stu_feats = []
+
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            # Match input dtype to module dtype
+            s = s.type(next(self.align_module[idx].parameters()).dtype)
+            t = t.type(next(self.align_module[idx].parameters()).dtype)
+            
+            if self.distiller == "cwd":
+                # Apply alignment and normalization
+                s = self.align_module[idx](s)
+                stu_feats.append(s)
+                tea_feats.append(t.detach())
+            else:
+                # Apply normalization
+                t = self.norm1[idx](t)
+                stu_feats.append(s)
+                tea_feats.append(t.detach())
+
+        loss = self.feature_loss(stu_feats, tea_feats)
+        return self.loss_weight * loss
+
+
+class DistillationLoss:
+    def __init__(self, models, modelt, distiller="CWDLoss"):
+        self.distiller = distiller
+        self.layers = ["6", "8", "13", "16", "19", "22"]
+        self.models = models 
+        self.modelt = modelt
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # ini warm up
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 640, 640)
+            _ = self.models(dummy_input.to(device))
+            _ = self.modelt(dummy_input.to(device))
+        
+        self.channels_s = []
+        self.channels_t = []
+        self.teacher_module_pairs = []
+        self.student_module_pairs = []
+        self.remove_handle = []
+        
+        self._find_layers()
+        
+        self.distill_loss_fn = FeatureLoss(
+            channels_s=self.channels_s, 
+            channels_t=self.channels_t, 
+            distiller=distiller[:3]
+        )
+        
+    def _find_layers(self):
+
+        self.channels_s = []
+        self.channels_t = []
+        self.teacher_module_pairs = []
+        self.student_module_pairs = []
+        
+        for name, ml in self.modelt.named_modules():
+            if name is not None:
+                name = name.split(".")
+                # print(name)
+                
+                if name[0] != "model":
+                    continue
+                if len(name) >= 3:
+                    if name[1] in self.layers:
+                        if "cv2" in name[2]:
+                            if hasattr(ml, 'conv'):
+                                self.channels_t.append(ml.conv.out_channels)
+                                self.teacher_module_pairs.append(ml)
+        # print()
+        for name, ml in self.models.named_modules():
+            if name is not None:
+                name = name.split(".")
+                # print(name)
+                if name[0] != "model":
+                    continue
+                if len(name) >= 3:
+                    if name[1] in self.layers:
+                        if "cv2" in name[2]:
+                            if hasattr(ml, 'conv'):
+                                self.channels_s.append(ml.conv.out_channels)
+                                self.student_module_pairs.append(ml)
+
+        nl = min(len(self.channels_s), len(self.channels_t))
+        self.channels_s = self.channels_s[-nl:]
+        self.channels_t = self.channels_t[-nl:]
+        self.teacher_module_pairs = self.teacher_module_pairs[-nl:]
+        self.student_module_pairs = self.student_module_pairs[-nl:]
+
+    def register_hook(self):
+        # Remove the existing hook if they exist
+        self.remove_handle_()
+        
+        self.teacher_outputs = []
+        self.student_outputs = []
+
+        def make_student_hook(l):
+            def forward_hook(m, input, output):
+                if isinstance(output, torch.Tensor):
+                    out = output.clone()  # Clone to ensure we don't modify the original
+                    l.append(out)
+                else:
+                    l.append([o.clone() if isinstance(o, torch.Tensor) else o for o in output])
+            return forward_hook
+
+        def make_teacher_hook(l):
+            def forward_hook(m, input, output):
+                if isinstance(output, torch.Tensor):
+                    l.append(output.detach().clone())  # Detach and clone teacher outputs
+                else:
+                    l.append([o.detach().clone() if isinstance(o, torch.Tensor) else o for o in output])
+            return forward_hook
+
+        for ml, ori in zip(self.teacher_module_pairs, self.student_module_pairs):
+            self.remove_handle.append(ml.register_forward_hook(make_teacher_hook(self.teacher_outputs)))
+            self.remove_handle.append(ori.register_forward_hook(make_student_hook(self.student_outputs)))
+
+    def get_loss(self):
+        if not self.teacher_outputs or not self.student_outputs:
+            return torch.tensor(0.0, requires_grad=True)
+        
+        if len(self.teacher_outputs) != len(self.student_outputs):
+            print(f"Warning: Mismatched outputs - Teacher: {len(self.teacher_outputs)}, Student: {len(self.student_outputs)}")
+            return torch.tensor(0.0, requires_grad=True)
+        
+        quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
+        
+        if self.distiller != 'cwd':
+            quant_loss *= 0.3
+
+        self.teacher_outputs.clear()
+        self.student_outputs.clear()
+        
+        return quant_loss
+
+    def remove_handle_(self):
+        for rm in self.remove_handle:
+            rm.remove()
+        self.remove_handle.clear()

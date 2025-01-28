@@ -1,9 +1,9 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Ultralytics YOLO 🚀, AGPL-3.0 license
 """
 Train a model on a dataset.
 
 Usage:
-    $ yolo mode=train model=yolo11n.pt data=coco8.yaml imgsz=640 epochs=100 batch=16
+    $ yolo mode=train model=yolov8n.pt data=coco8.yaml imgsz=640 epochs=100 batch=16
 """
 
 import gc
@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
 
@@ -41,6 +42,7 @@ from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
+from ultralytics.utils.loss import DistillationLoss
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
@@ -53,7 +55,6 @@ from ultralytics.utils.torch_utils import (
     strip_optimizer,
     torch_distributed_zero_first,
 )
-
 
 class BaseTrainer:
     """
@@ -104,6 +105,18 @@ class BaseTrainer:
         self.validator = None
         self.metrics = None
         self.plots = {}
+        
+        if overrides:
+            self.teacher = overrides.get("teacher", None)
+            self.loss_type = overrides.get("distillation_loss", None)
+            if "teacher" in overrides:
+                overrides.pop("teacher")
+            if "distillation_loss" in overrides:
+                overrides.pop("distillation_loss")
+        else:
+            self.loss_type = None
+            self.teacher = None
+        
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -229,15 +242,19 @@ class BaseTrainer:
 
     def _setup_train(self, world_size):
         """Builds dataloaders and optimizer on correct rank process."""
+        
         # Model
         self.run_callbacks("on_pretrain_routine_start")
         ckpt = self.setup_model()
-        self.set_model_attributes()
-        with torch.no_grad():
-            teacher, _ = torch_safe_load("yolov8m.pt") # calls Model(cfg, weights)
-            teacher = teacher["model"].to(self.device).float().eval()
-            self.model.teacher = teacher.to(self.device)
         self.model = self.model.to(self.device)
+        
+        # Load teacher model to device
+        if self.teacher is not None:
+            for k, v in self.teacher.named_parameters():
+                v.requires_grad = True
+            self.teacher = self.teacher.to(self.device)
+                
+        self.set_model_attributes()
 
         # Freeze layers
         freeze_list = (
@@ -251,7 +268,7 @@ class BaseTrainer:
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-            if any(x in k for x in freeze_layer_names) or k.startswith("teacher."):
+            if any(x in k for x in freeze_layer_names):
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
@@ -275,6 +292,10 @@ class BaseTrainer:
         )
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+            
+            if self.teacher is not None:
+                self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
+                self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -283,7 +304,12 @@ class BaseTrainer:
 
         # Batch size
         if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
-            self.args.batch = self.batch_size = self.auto_batch()
+            self.args.batch = self.batch_size = check_train_batch_size(
+                model=self.model,
+                imgsz=self.args.imgsz,
+                amp=self.amp,
+                batch=self.batch_size,
+            )
 
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)
@@ -306,6 +332,7 @@ class BaseTrainer:
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
         self.optimizer = self.build_optimizer(
             model=self.model,
+            teacher=self.teacher,
             name=self.args.optimizer,
             lr=self.args.lr0,
             momentum=self.args.momentum,
@@ -341,6 +368,11 @@ class BaseTrainer:
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+            
+        # make loss
+        if self.teacher is not None:
+            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+        
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
@@ -363,6 +395,10 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+            
+            if self.teacher is not None:
+                distillation_loss.register_hook()
+            
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -387,6 +423,16 @@ class BaseTrainer:
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
+                    
+                # Add more distillation logic
+                if self.teacher is not None:
+                    distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                    with torch.no_grad():
+                        pred = self.teacher(batch['img'])
+                        
+                    self.d_loss = distillation_loss.get_loss()
+                    self.d_loss *- distill_weight
+                    self.loss += self.d_loss
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
@@ -424,6 +470,10 @@ class BaseTrainer:
                         self.plot_training_samples(batch, ni)
 
                 self.run_callbacks("on_train_batch_end")
+                
+            # More distillation logic
+            if self.teacher is not None:
+                distillation_loss.remove_handle_()
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
@@ -475,17 +525,11 @@ class BaseTrainer:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")
         self._clear_memory()
+        
+        # Distill logic
+        if self.teacher is not None:
+            distillation_loss.remove_handle_()
         self.run_callbacks("teardown")
-
-    def auto_batch(self, max_num_obj=0):
-        """Get batch size by calculating memory occupation of model."""
-        return check_train_batch_size(
-            model=self.model,
-            imgsz=self.args.imgsz,
-            amp=self.amp,
-            batch=self.batch_size,
-            max_num_obj=max_num_obj,
-        )  # returns batch size
 
     def _get_memory(self):
         """Get accelerator memory utilization in GB."""
@@ -759,13 +803,14 @@ class BaseTrainer:
             LOGGER.info("Closing dataloader mosaic")
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
 
-    def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+    def build_optimizer(self, model, teacher=None, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """
         Constructs an optimizer for the given model, based on the specified optimizer name, learning rate, momentum,
         weight decay, and number of iterations.
 
         Args:
             model (torch.nn.Module): The model for which to build an optimizer.
+            teacher (torch.nn.Module): the teacher model that will help the model to improve.
             name (str, optional): The name of the optimizer to use. If 'auto', the optimizer is selected
                 based on the number of iterations. Default: 'auto'.
             lr (float, optional): The learning rate for the optimizer. Default: 0.001.
@@ -785,7 +830,7 @@ class BaseTrainer:
                 f"ignoring 'lr0={self.args.lr0}' and 'momentum={self.args.momentum}' and "
                 f"determining best 'optimizer', 'lr0' and 'momentum' automatically... "
             )
-            nc = self.data.get("nc", 10)  # number of classes
+            nc = getattr(model, "nc", 10)  # number of classes
             lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places
             name, lr, momentum = ("SGD", 0.01, 0.9) if iterations > 10000 else ("AdamW", lr_fit, 0.9)
             self.args.warmup_bias_lr = 0.0  # no higher than 0.01 for Adam
@@ -799,9 +844,16 @@ class BaseTrainer:
                     g[1].append(param)
                 else:  # weight (with decay)
                     g[0].append(param)
+                    
+        if teacher is not None:
+            for v in teacher.modules():
+                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+                    g[2].append(v.bias)
+                if isinstance(v, bn):  # weight (no decay)
+                    g[1].append(v.weight)
+                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+                    g[0].append(v.weight)
 
-        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
-        name = {x.lower(): x for x in optimizers}.get(name.lower())
         if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
             optimizer = getattr(optim, name, optim.Adam)(g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
         elif name == "RMSProp":
@@ -810,14 +862,15 @@ class BaseTrainer:
             optimizer = optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
         else:
             raise NotImplementedError(
-                f"Optimizer '{name}' not found in list of available optimizers {optimizers}. "
-                "Request support for addition optimizers at https://github.com/ultralytics/ultralytics."
+                f"Optimizer '{name}' not found in list of available optimizers "
+                f"[Adam, AdamW, NAdam, RAdam, RMSProp, SGD, auto]."
+                "To request support for addition optimizers please visit https://github.com/ultralytics/ultralytics."
             )
 
         optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay
         optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})  # add g1 (BatchNorm2d weights)
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
-            f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"
+            f'{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)'
         )
         return optimizer
